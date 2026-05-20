@@ -23,13 +23,10 @@ from predict import (
     PROC,
     SPEAKERS,
     CNN_MODEL_PATH,
-    KMEANS_PKL_PATH,
     SAMPLE_RATE,
     CHUNK_DURATION,
     convert_to_wav,
     load_cnn_model      as _load_cnn,
-    load_kmeans_bundle  as _load_kmeans,
-    cluster_confidence,
 )
 
 # =============================================================================
@@ -136,18 +133,13 @@ def get_cnn_model():
     return _load_cnn()
 
 
-@st.cache_resource(show_spinner="Loading K-Means bundle…")
-def get_kmeans_bundle():
-    if not os.path.exists(KMEANS_PKL_PATH):
-        return None
-    return _load_kmeans()
-
-
-# =============================================================================
-# Inference helpers — return structured dicts instead of printing
-# =============================================================================
 def _run_cnn(wav_path: str, model) -> dict:
-    """CNN chunk-by-chunk inference.  Returns structured result dict."""
+    """
+    CNN chunk-by-chunk inference. 
+    It reads the audio, splits it into chunks, and predicts the speaker for each chunk.
+    Returns a structured dictionary with the final results.
+    """
+    # 1. Load audio and split into small chunks
     audio, _ = librosa.load(wav_path, sr=SAMPLE_RATE)
     chunks   = PROC.split_audio(audio)
 
@@ -161,6 +153,7 @@ def _run_cnn(wav_path: str, model) -> dict:
         progress.progress((idx + 1) / max(len(chunks), 1),
                           text=f"Chunk {idx+1} / {len(chunks)}")
 
+        # 2. Skip silent chunks where nobody is talking
         if PROC.is_silent(chunk):
             chunk_details.append({
                 "Chunk": idx, "Speaker": "—",
@@ -168,12 +161,16 @@ def _run_cnn(wav_path: str, model) -> dict:
             })
             continue
 
+        # 3. Get the spectrogram image for this chunk and add a batch dimension
         spec  = np.expand_dims(PROC.chunk_to_spectrogram(chunk), 0)  # (1,128,128,1)
+        
+        # 4. Model predicts the speaker!
         probs = model.predict(spec, verbose=0)[0]
         pidx  = int(np.argmax(probs))
         spk   = SPEAKERS[pidx]
         conf  = float(probs[pidx])
 
+        # 5. Record their vote and confidence
         votes[spk] += 1
         conf_lists[spk].append(conf)
 
@@ -184,6 +181,7 @@ def _run_cnn(wav_path: str, model) -> dict:
 
     progress.empty()
 
+    # 6. Calculate final results based on majority vote
     total = sum(votes.values())
     if total == 0:
         return None
@@ -201,70 +199,6 @@ def _run_cnn(wav_path: str, model) -> dict:
         "chunk_details": chunk_details,
         "total":         total,
         "model_type":    "CNN",
-    }
-
-
-def _run_kmeans(wav_path: str, bundle: dict) -> dict:
-    """K-Means chunk-by-chunk inference.  Returns structured result dict."""
-    kmeans      = bundle["kmeans"]
-    scaler      = bundle["scaler"]
-    cluster_map = bundle["cluster_map"]
-
-    audio, _ = librosa.load(wav_path, sr=SAMPLE_RATE)
-    chunks   = PROC.split_audio(audio)
-
-    chunk_details = []
-    votes         = {s: 0  for s in SPEAKERS}
-    conf_lists    = {s: [] for s in SPEAKERS}
-
-    progress = st.progress(0, text="Analysing chunks…")
-
-    for idx, chunk in enumerate(chunks):
-        progress.progress((idx + 1) / max(len(chunks), 1),
-                          text=f"Chunk {idx+1} / {len(chunks)}")
-
-        if PROC.is_silent(chunk):
-            chunk_details.append({
-                "Chunk": idx, "Speaker": "—",
-                "Confidence": "—", "Status": "Silent"
-            })
-            continue
-
-        feat       = PROC.chunk_to_kmeans_features(chunk)
-        feat_sc    = scaler.transform(feat.reshape(1, -1))
-        cluster_id = int(kmeans.predict(feat_sc)[0])
-        spk        = cluster_map[cluster_id]
-        conf       = cluster_confidence(kmeans, scaler, feat)
-
-        votes[spk] += 1
-        conf_lists[spk].append(conf)
-
-        chunk_details.append({
-            "Chunk":      idx,
-            "Speaker":    spk,
-            "Confidence": f"{conf*100:.1f}%",
-            "Status":     f"Cluster {cluster_id}",
-        })
-
-    progress.empty()
-
-    total = sum(votes.values())
-    if total == 0:
-        return None
-
-    avg_conf = {
-        s: (float(np.mean(conf_lists[s])) if conf_lists[s] else 0.0)
-        for s in SPEAKERS
-    }
-
-    return {
-        "winner":        max(votes, key=votes.get),
-        "votes":         votes,
-        "vote_pcts":     {s: votes[s] / total * 100 for s in SPEAKERS},
-        "avg_conf":      avg_conf,
-        "chunk_details": chunk_details,
-        "total":         total,
-        "model_type":    "K-Means",
     }
 
 
@@ -355,18 +289,8 @@ with st.sidebar:
     # ── Model selector ──────────────────────────────────────────────────────
     st.markdown("### ⚙️ Model Configuration")
 
-    model_choice = st.radio(
-        "Select inference engine",
-        options=["CNN (Deep Learning)", "K-Means (Statistical Clustering)"],
-        index=0,
-        help=(
-            "CNN: Trained on mel spectrogram images. High accuracy.\n\n"
-            "K-Means: Trained on 144-dim DSP features (MFCCs, spectral "
-            "contrast, deltas). Fully unsupervised."
-        ),
-    )
-
-    use_cnn = model_choice.startswith("CNN")
+    # We use a Deep Learning Convolutional Neural Network (CNN) for our inference
+    st.info("Using CNN (Deep Learning) model for high accuracy speaker identification.")
 
     st.markdown("---")
 
@@ -378,7 +302,7 @@ with st.sidebar:
 
     chunk_samples = PROC.chunk_samples
     st.caption(f"Chunk size: {chunk_samples:,} samples")
-    st.caption(f"Mel bands: {PROC.N_MELS}   •   MFCCs: {PROC.N_MFCC}")
+    st.caption(f"Mel bands: {PROC.N_MELS}")
 
     st.markdown("---")
 
@@ -386,18 +310,13 @@ with st.sidebar:
     st.markdown("### 🗂️ Model Files")
 
     cnn_exists    = os.path.exists(CNN_MODEL_PATH)
-    kmeans_exists = os.path.exists(KMEANS_PKL_PATH)
 
     st.markdown(
-        f"{'✅' if cnn_exists    else '❌'} CNN model "
+        f"{'✅' if cnn_exists else '❌'} CNN model "
         f"(`{os.path.basename(CNN_MODEL_PATH)}`)"
     )
-    st.markdown(
-        f"{'✅' if kmeans_exists else '❌'} K-Means bundle "
-        f"(`{os.path.basename(KMEANS_PKL_PATH)}`)"
-    )
 
-    if not cnn_exists and not kmeans_exists:
+    if not cnn_exists:
         st.warning("No models found. Run `train.py` first.")
 
     st.markdown("---")
@@ -505,7 +424,7 @@ with play_col:
     st.markdown("<br>", unsafe_allow_html=True)
     st.metric("Duration",  f"{duration:.1f} s")
     st.metric("Chunks",    str(n_chunks))
-    st.metric("Model",     "CNN" if use_cnn else "K-Means")
+    st.metric("Model",     "CNN")
 
 # =============================================================================
 # Inference
@@ -513,47 +432,23 @@ with play_col:
 st.markdown("---")
 st.markdown("### 🔍 Speaker Identification")
 
-model_label = "CNN (Deep Learning)" if use_cnn else "K-Means (Statistical Clustering)"
-
 if st.button(
-    f"🚀  Identify Speaker  —  {model_label}",
+    "🚀  Identify Speaker  —  CNN",
     type="primary",
     use_container_width=True,
 ):
 
     # ── Load model ────────────────────────────────────────────────────────
-    if use_cnn:
-        model = get_cnn_model()
-        if model is None:
-            st.error(
-                f"❌ CNN model not found at `{CNN_MODEL_PATH}`. "
-                "Run `train.py` first."
-            )
-            st.stop()
+    model = get_cnn_model()
+    if model is None:
+        st.error(
+            f"❌ CNN model not found at `{CNN_MODEL_PATH}`. "
+            "Run `train.py` first."
+        )
+        st.stop()
 
-        with st.spinner("Running CNN inference…"):
-            result = _run_cnn(wav_path, model)
-
-    else:
-        bundle = get_kmeans_bundle()
-        if bundle is None:
-            st.error(
-                f"❌ K-Means bundle not found at `{KMEANS_PKL_PATH}`. "
-                "Run `train.py` first."
-            )
-            st.stop()
-
-        # Sanity check feature dimension
-        if bundle["n_features"] != PROC.n_features:
-            st.error(
-                f"❌ Feature dimension mismatch: bundle has "
-                f"{bundle['n_features']} dims but processor expects "
-                f"{PROC.n_features}. Re-run `train.py`."
-            )
-            st.stop()
-
-        with st.spinner("Running K-Means inference…"):
-            result = _run_kmeans(wav_path, bundle)
+    with st.spinner("Running CNN inference…"):
+        result = _run_cnn(wav_path, model)
 
     # ── No valid chunks ───────────────────────────────────────────────────
     if result is None:
@@ -646,6 +541,6 @@ if "result" in st.session_state:
 # =============================================================================
 st.markdown("---")
 st.caption(
-    "VocalCanvas · CNN + K-Means Speaker Identification  "
+    "VocalCanvas · CNN Speaker Identification  "
     "· Powered by librosa, TensorFlow, scikit-learn & Streamlit"
 )
